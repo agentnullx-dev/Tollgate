@@ -1,0 +1,623 @@
+// Tollgate data model
+// Money is stored as BigInt micro-USD (1 USD = 1_000_000 micros) to avoid
+// floating point drift in ledgers and budget enforcement.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum PlanTier {
+  FREE
+  TEAM
+  BUSINESS
+  ENTERPRISE
+}
+
+// OWNER and ADMIN map to org:admin, DEVELOPER to org:developer, VIEWER to org:viewer.
+enum MemberRole {
+  OWNER
+  ADMIN
+  DEVELOPER
+  VIEWER
+}
+
+enum BillingStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  // Gateway refuses every request for the organization.
+  SUSPENDED
+  CANCELED
+}
+
+enum StripeEventStatus {
+  PROCESSING
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+enum AgentStatus {
+  ACTIVE
+  PAUSED
+  KILLED
+  // Set only by the anomaly engine. Release requires org:admin and a reason.
+  QUARANTINED
+}
+
+enum AgentEnforcementMode {
+  // Budgets with BLOCK enforcement refuse requests for this agent.
+  STRICT
+  // Budgets are evaluated and alerted on, but never block this agent.
+  ALERT_ONLY
+}
+
+enum BudgetScope {
+  ORGANIZATION
+  PROJECT
+  AGENT
+}
+
+enum BudgetPeriod {
+  DAILY
+  WEEKLY
+  MONTHLY
+  TOTAL
+}
+
+enum BudgetEnforcement {
+  BLOCK
+  ALERT_ONLY
+}
+
+enum UsageStatus {
+  SUCCESS
+  ERROR
+  CANCELLED
+}
+
+enum LedgerEntryType {
+  USAGE_DEBIT
+  MANUAL_ADJUSTMENT
+  REFUND
+  // Zero-amount, immutable marker linking a security incident into the ledger timeline.
+  SECURITY_INCIDENT
+}
+
+enum AlertType {
+  BUDGET_THRESHOLD
+  BUDGET_BLOCKED
+  BUDGET_LIMIT_BYPASSED
+  VELOCITY_LIMIT
+  AGENT_KILLED
+  AGENT_QUARANTINED
+  ANOMALY_DETECTED
+  BILLING_SUSPENDED
+  BILLING_RESTORED
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum ActorType {
+  USER
+  API_KEY
+  SYSTEM
+}
+
+enum IncidentType {
+  SPEND_ANOMALY
+  TOKEN_ANOMALY
+}
+
+enum IncidentStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  FALSE_POSITIVE
+}
+
+enum NotificationChannelType {
+  SLACK
+  TEAMS
+  EMAIL
+  WEBHOOK
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENDING
+  RETRY_SCHEDULED
+  DELIVERED
+  DEAD
+  SKIPPED
+}
+
+// ---------------------------------------------------------------------------
+// Identity & authentication (Auth.js / NextAuth compatible)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  name          String?
+  emailVerified DateTime?
+  image         String?
+  // Set to lock a user out of every organization immediately.
+  disabledAt    DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  accounts      Account[]
+  sessions      Session[]
+  memberships   Membership[]
+  apiKeys       ApiKey[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id            String        @id @default(cuid())
+  name          String
+  slug          String        @unique
+  plan                 PlanTier              @default(FREE)
+  billingStatus        BillingStatus         @default(ACTIVE)
+  stripeCustomerId     String?               @unique
+  stripeSubscriptionId String?               @unique
+  stripePriceId        String?
+  currentPeriodEnd     DateTime?
+  // Timestamp (Stripe event.created) of the newest subscription state applied; older events are ignored.
+  billingSyncedAt      DateTime?
+  stripeEvents         StripeEvent[]
+  billingSuspensions   BillingSuspension[]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  notificationChannels NotificationChannel[]
+  securityIncidents    SecurityIncident[]
+  memberships          Membership[]
+  projects      Project[]
+  apiKeys       ApiKey[]
+  agents        Agent[]
+  budgets       Budget[]
+  usageEvents   UsageEvent[]
+  ledgerEntries LedgerEntry[]
+  alerts        Alert[]
+  auditLogs     AuditLog[]
+
+  @@map("organizations")
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  userId         String
+  organizationId String
+  role           MemberRole   @default(MEMBER)
+  createdAt      DateTime     @default(now())
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@map("memberships")
+}
+
+model Project {
+  id             String        @id @default(cuid())
+  organizationId String
+  name           String
+  slug           String
+  environment    String        @default("production")
+  archivedAt     DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apiKeys        ApiKey[]
+  agents         Agent[]
+  budgets        Budget[]
+  usageEvents    UsageEvent[]
+  ledgerEntries  LedgerEntry[]
+
+  @@unique([organizationId, slug])
+  @@map("projects")
+}
+
+model ApiKey {
+  id             String       @id @default(cuid())
+  organizationId String
+  projectId      String
+  name           String
+  // Public, non-secret lookup prefix (12 hex chars). The secret is never stored.
+  prefix         String       @unique
+  // SHA-256 hex digest of the full plaintext key.
+  hashedKey      String
+  scopes         String[]
+  createdById    String?
+  lastUsedAt     DateTime?
+  expiresAt      DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project        Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy      User?        @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  usageEvents    UsageEvent[]
+
+  @@index([organizationId])
+  @@index([projectId])
+  @@map("api_keys")
+}
+
+// ---------------------------------------------------------------------------
+// Core domain: agents, budgets, pricing
+// ---------------------------------------------------------------------------
+
+model Agent {
+  id                   String        @id @default(cuid())
+  organizationId       String
+  projectId            String
+  // Identifier the customer's code sends (e.g. "support-triage-bot").
+  externalId           String
+  displayName          String?
+  status               AgentStatus          @default(ACTIVE)
+  enforcementMode      AgentEnforcementMode @default(STRICT)
+  quarantinedAt        DateTime?
+  // Runaway-loop guard: max authorize calls per rolling minute. Null = unlimited.
+  maxRequestsPerMinute Int?
+  autoKillOnVelocity   Boolean       @default(false)
+  killedAt             DateTime?
+  killReason           String?
+  lastSeenAt           DateTime?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  organization         Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project              Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  budgets              Budget[]
+  usageEvents          UsageEvent[]
+  ledgerEntries        LedgerEntry[]
+  alerts               Alert[]
+  securityIncidents    SecurityIncident[]
+
+  @@unique([projectId, externalId])
+  @@index([organizationId, status])
+  @@map("agents")
+}
+
+model Budget {
+  id              String            @id @default(cuid())
+  organizationId  String
+  scope           BudgetScope
+  projectId       String?
+  agentId         String?
+  name            String
+  period          BudgetPeriod
+  limitMicros     BigInt
+  enforcement     BudgetEnforcement @default(BLOCK)
+  alertThresholds Int[]             @default([50, 80, 90, 100])
+  isActive        Boolean           @default(true)
+  // Set for budgets owned by a system (e.g. "billing"); their limits follow the subscription.
+  managedBy       String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  organization    Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project         Project?          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  agent           Agent?            @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  alerts          Alert[]
+
+  @@unique([organizationId, managedBy])
+  @@index([organizationId, isActive])
+  @@index([projectId])
+  @@index([agentId])
+  @@map("budgets")
+}
+
+model ModelPrice {
+  id                       String   @id @default(cuid())
+  provider                 String
+  model                    String
+  // Micro-USD per one million tokens.
+  inputMicrosPerMTok       BigInt
+  outputMicrosPerMTok      BigInt
+  cachedInputMicrosPerMTok BigInt   @default(0)
+  effectiveFrom            DateTime @default(now())
+  createdAt                DateTime @default(now())
+
+  @@unique([provider, model, effectiveFrom])
+  @@index([provider, model])
+  @@map("model_prices")
+}
+
+// ---------------------------------------------------------------------------
+// Transactional history
+// ---------------------------------------------------------------------------
+
+model UsageEvent {
+  id                String       @id @default(cuid())
+  organizationId    String
+  projectId         String
+  agentId           String
+  apiKeyId          String?
+  // Client-supplied; guarantees exactly-once accounting on retries.
+  idempotencyKey    String
+  reservationId     String?
+  provider          String
+  model             String
+  inputTokens       Int
+  outputTokens      Int
+  cachedInputTokens Int          @default(0)
+  costMicros        BigInt
+  latencyMs         Int?
+  status            UsageStatus  @default(SUCCESS)
+  traceId           String?
+  metadata          Json?
+  occurredAt        DateTime
+  createdAt         DateTime     @default(now())
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project           Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  agent             Agent        @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  apiKey            ApiKey?      @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  ledgerEntry       LedgerEntry?
+
+  @@unique([projectId, idempotencyKey])
+  @@index([organizationId, occurredAt])
+  @@index([projectId, occurredAt])
+  @@index([agentId, occurredAt])
+  @@map("usage_events")
+}
+
+model LedgerEntry {
+  id                 String            @id @default(cuid())
+  organizationId     String
+  projectId          String?
+  agentId            String?
+  usageEventId       String?           @unique
+  securityIncidentId String?           @unique
+  type           LedgerEntryType
+  // Positive = spend (debit), negative = credit/refund.
+  amountMicros   BigInt
+  description    String?
+  createdAt      DateTime        @default(now())
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project        Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  agent          Agent?          @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  usageEvent     UsageEvent?     @relation(fields: [usageEventId], references: [id], onDelete: Cascade)
+  securityIncident SecurityIncident? @relation(fields: [securityIncidentId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, createdAt])
+  @@map("ledger_entries")
+}
+
+model Alert {
+  id               String        @id @default(cuid())
+  organizationId   String
+  budgetId         String?
+  agentId          String?
+  type             AlertType
+  severity         AlertSeverity
+  // DB-enforced de-duplication, e.g. "threshold:<budget>:<period>:80".
+  dedupeKey        String        @unique
+  periodKey        String?
+  threshold        Int?
+  message          String
+  payload          Json?
+  acknowledgedAt     DateTime?
+  acknowledgedById   String?
+  securityIncidentId String?
+  // Outbox marker: set once deliveries have been fanned out to every channel.
+  fanoutAt           DateTime?
+  createdAt          DateTime               @default(now())
+  organization       Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  budget             Budget?                @relation(fields: [budgetId], references: [id], onDelete: SetNull)
+  agent              Agent?                 @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  securityIncident   SecurityIncident?      @relation(fields: [securityIncidentId], references: [id], onDelete: SetNull)
+  deliveries         NotificationDelivery[]
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, acknowledgedAt])
+  @@index([fanoutAt, createdAt])
+  @@map("alerts")
+}
+
+model AuditLog {
+  id             String       @id @default(cuid())
+  organizationId String
+  actorType      ActorType
+  actorId        String?
+  action         String
+  targetType     String
+  targetId       String
+  before         Json?
+  after          Json?
+  requestId      String?
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+  @@index([targetType, targetId])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Security: anomaly detection incidents
+// ---------------------------------------------------------------------------
+
+model SecurityIncident {
+  id                 String         @id @default(cuid())
+  organizationId     String
+  agentId            String
+  type               IncidentType
+  severity           AlertSeverity
+  status             IncidentStatus @default(OPEN)
+  // e.g. "anomaly:<agentId>:<windowEndMinute>"; makes detection idempotent across engine replicas.
+  dedupeKey          String         @unique
+  detector           String
+  detectorVersion    String
+  windowStart        DateTime
+  windowEnd          DateTime
+  windowSpendMicros  BigInt
+  baselineMeanMicros Float
+  baselineStdMicros  Float
+  thresholdMicros    Float
+  zScore             Float
+  actionTaken        String
+  evidence           Json
+  resolvedAt         DateTime?
+  resolvedById       String?
+  resolutionNote     String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  organization       Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  agent              Agent          @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  ledgerEntry        LedgerEntry?
+  alerts             Alert[]
+
+  @@index([organizationId, status, createdAt])
+  @@index([agentId, createdAt])
+  @@map("security_incidents")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model NotificationChannel {
+  id               String                  @id @default(cuid())
+  organizationId   String
+  type             NotificationChannelType
+  name             String
+  // AES-256-GCM ciphertext of the destination (webhook URL or JSON list of email recipients).
+  targetCiphertext String
+  // Non-secret display hint, e.g. "hooks.slack.com/…/XyZ1" or "2 recipients".
+  targetHint       String
+  // Optional HMAC secret for generic webhooks, also encrypted.
+  secretCiphertext String?
+  minSeverity      AlertSeverity           @default(WARNING)
+  // Empty = every alert type.
+  alertTypes       AlertType[]
+  isEnabled        Boolean                 @default(true)
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+  organization     Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  deliveries       NotificationDelivery[]
+
+  @@index([organizationId, isEnabled])
+  @@map("notification_channels")
+}
+
+model NotificationDelivery {
+  id                String              @id @default(cuid())
+  alertId           String
+  channelId         String
+  status            DeliveryStatus      @default(PENDING)
+  attempts          Int                 @default(0)
+  nextAttemptAt     DateTime            @default(now())
+  lastAttemptAt     DateTime?
+  lastError         String?
+  lastStatusCode    Int?
+  deliveredAt       DateTime?
+  providerMessageId String?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  alert             Alert               @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  channel           NotificationChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([alertId, channelId])
+  @@index([status, nextAttemptAt])
+  @@map("notification_deliveries")
+}
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+/** Every Stripe webhook event received; the primary key makes processing idempotent. */
+model StripeEvent {
+  id             String            @id
+  type           String
+  status         StripeEventStatus @default(PROCESSING)
+  organizationId String?
+  attempts       Int               @default(1)
+  outcome        String?
+  error          String?
+  livemode       Boolean
+  stripeCreated  DateTime
+  receivedAt     DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  organization   Organization?     @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, receivedAt])
+  @@index([status, updatedAt])
+  @@map("stripe_events")
+}
+
+/** One non-payment suspension and exactly which agents it stopped, so restoration is precise. */
+model BillingSuspension {
+  id             String       @id @default(cuid())
+  organizationId String
+  reason         String
+  stripeInvoiceId String?
+  sourceEventId  String
+  agentIds       String[]
+  createdAt      DateTime     @default(now())
+  liftedAt       DateTime?
+  liftedByEventId String?
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, sourceEventId])
+  @@index([organizationId, liftedAt])
+  @@map("billing_suspensions")
+}

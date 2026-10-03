@@ -1,0 +1,197 @@
+# One command local stack:  docker compose up --build
+#   App + API ......... http://localhost:3000   (console at /dashboard)
+#   Alert inbox ....... http://localhost:8025   (Mailpit catches every alert email)
+#   Worker metrics .... http://localhost:9100/metrics
+# Production-like images:   docker compose --profile prod up --build app-prod worker-prod
+
+name: tollgate
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://tollgate:tollgate@postgres:5432/tollgate?schema=public
+  REDIS_URL: redis://redis:6379/0
+  APP_BASE_URL: http://localhost:3000
+  RESERVATION_TTL_SECONDS: "300"
+  API_RATE_LIMIT_PER_MINUTE: "1200"
+  CACHE_TTL_SECONDS: "30"
+  LOG_LEVEL: info
+  # Development-only key. Generate a real one with: openssl rand -base64 32
+  NOTIFICATION_ENCRYPTION_KEY: ZGV2LW9ubHktdG9sbGdhdGUta2V5LWRvLW5vdC11c2U=
+  SMTP_URL: smtp://mailpit:1025
+  EMAIL_FROM: "Tollgate Alerts <alerts@tollgate.local>"
+  NOTIFY_MAX_ATTEMPTS: "10"
+  NOTIFY_BACKOFF_BASE_MS: "2000"
+  NOTIFY_BACKOFF_MAX_MS: "1800000"
+  ANOMALY_TICK_MS: "15000"
+  ANOMALY_SIGMA: "3"
+  ANOMALY_WINDOW_MINUTES: "5"
+  ANOMALY_BASELINE_MINUTES: "60"
+  ANOMALY_AUTO_QUARANTINE: "true"
+  SEED_API_KEY: tg_live_0123456789ab_devdevdevdevdevdevdevdevdevdevde
+  # Auth.js. Development-only secret; generate a real one with: npx auth secret
+  AUTH_SECRET: dev-only-auth-secret-change-me-0123456789abcdef
+  AUTH_URL: http://localhost:3000
+  AUTH_TRUST_HOST: "true"
+  AUTH_DEV_LOGIN: "true"
+  # Billing (optional). Use `stripe listen --forward-to localhost:3000/api/webhooks/stripe`.
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  BILLING_SUSPEND_POLICY: ${BILLING_SUSPEND_POLICY:-immediate}
+  # Optional: real destinations for the seeded channels.
+  SEED_SLACK_WEBHOOK_URL: ${SEED_SLACK_WEBHOOK_URL:-}
+  SEED_TEAMS_WEBHOOK_URL: ${SEED_TEAMS_WEBHOOK_URL:-}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tollgate
+      POSTGRES_PASSWORD: tollgate
+      POSTGRES_DB: tollgate
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tollgate -d tollgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Budget counters and delivery queues must never be evicted; AOF keeps them across restarts.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+
+  # Applies the schema and seeds dev data, then exits.
+  migrate:
+    build:
+      context: .
+      target: dev
+    image: tollgate-dev
+    command: ["sh", "-c", "npx prisma db push --skip-generate && npx prisma db seed"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      target: dev
+    image: tollgate-dev
+    command: ["npm", "run", "dev"]
+    environment:
+      <<: *app-env
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+      - next_cache:/app/.next
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+  worker:
+    build:
+      context: .
+      target: dev
+    image: tollgate-dev
+    command: ["npm", "run", "worker:dev"]
+    environment:
+      <<: *app-env
+      NODE_ENV: development
+      WORKER_HEALTH_PORT: "9100"
+    ports:
+      - "9100:9100"
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      # The worker retries SMTP with backoff, so "started" is enough.
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9100/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  app-prod:
+    profiles: ["prod"]
+    build:
+      context: .
+      target: runner
+    image: tollgate:latest
+    environment:
+      <<: *app-env
+      NODE_ENV: production
+    ports:
+      - "3001:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker-prod:
+    profiles: ["prod"]
+    build:
+      context: .
+      target: worker
+    image: tollgate-worker:latest
+    environment:
+      <<: *app-env
+      NODE_ENV: production
+    deploy:
+      replicas: 2
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  node_modules:
+  next_cache:

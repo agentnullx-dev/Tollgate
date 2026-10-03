@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+  AUTH_SECRET: ci-only-auth-secret-0123456789abcdef0123456789
+  AUTH_TRUST_HOST: "true"
+
+jobs:
+  verify:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://tollgate:tollgate@localhost:5432/tollgate?schema=public
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package.json
+      - name: Install
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - name: Validate Prisma schema
+        run: npx prisma validate
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
+
+  integration:
+    name: End-to-end smoke test
+    runs-on: ubuntu-latest
+    needs: verify
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tollgate
+          POSTGRES_PASSWORD: tollgate
+          POSTGRES_DB: tollgate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tollgate -d tollgate"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://tollgate:tollgate@localhost:5432/tollgate?schema=public
+      REDIS_URL: redis://localhost:6379/0
+      SEED_API_KEY: tg_live_0123456789ab_devdevdevdevdevdevdevdevdevdevde
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package.json
+      - run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - run: npx prisma db push --skip-generate
+      - run: npx prisma db seed
+      - run: npm run build
+      - name: Start server
+        run: |
+          npm start > server.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS http://localhost:3000/api/health && break
+            sleep 1
+          done
+      - name: Start worker
+        run: |
+          NOTIFICATION_ENCRYPTION_KEY=ZGV2LW9ubHktdG9sbGdhdGUta2V5LWRvLW5vdC11c2U= npm run worker > worker.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:9100/healthz && break
+            sleep 1
+          done
+      - name: Smoke test
+        run: bash scripts/smoke.sh
+        env:
+          BASE_URL: http://localhost:3000
+          API_KEY: ${{ env.SEED_API_KEY }}
+      - name: Worker metrics
+        if: always()
+        run: curl -fsS http://localhost:9100/metrics || true
+      - name: Server and worker logs
+        if: always()
+        run: cat server.log worker.log || true
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    needs: [verify, integration]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: worker
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/${{ github.repository }}-worker:latest
+            ghcr.io/${{ github.repository }}-worker:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

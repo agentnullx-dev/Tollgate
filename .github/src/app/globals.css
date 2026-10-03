@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-paper text-ink antialiased;
+    font-feature-settings: "ss01" 1;
+  }
+
+  :focus-visible {
+    outline: 2px solid #13233f;
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  ::selection {
+    background: #d3ede8;
+  }
+}
+
+@layer components {
+  /* Tabular figures keep money columns aligned without resorting to monospace. */
+  .num {
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .panel {
+    @apply rounded-md border border-rule bg-panel;
+  }
+
+  .hatch {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      rgba(217, 154, 30, 0.95) 0 4px,
+      rgba(217, 154, 30, 0.55) 4px 8px
+    );
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
