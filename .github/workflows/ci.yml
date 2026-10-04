@@ -64,6 +64,7 @@ jobs:
       DATABASE_URL: postgresql://tollgate:tollgate@localhost:5432/tollgate?schema=public
       REDIS_URL: redis://localhost:6379/0
       SEED_API_KEY: tg_live_0123456789ab_devdevdevdevdevdevdevdevdevdevde
+      NOTIFICATION_ENCRYPTION_KEY: ZGV2LW9ubHktdG9sbGdhdGUta2V5LWRvLW5vdC11c2U=
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -84,7 +85,7 @@ jobs:
           done
       - name: Start worker
         run: |
-          NOTIFICATION_ENCRYPTION_KEY=ZGV2LW9ubHktdG9sbGdhdGUta2V5LWRvLW5vdC11c2U= npm run worker > worker.log 2>&1 &
+          npm run worker > worker.log 2>&1 &
           for i in $(seq 1 30); do
             curl -fsS http://localhost:9100/healthz && break
             sleep 1
