@@ -71,7 +71,7 @@ describe("evaluateWindow", () => {
 
   it("ignores spikes below the materiality floor", () => {
     const values = steady(now - 200, now - 5, 500);
-    for (let m = now - 4; m <= now; m++) values.push([m, 20_000]);
+    for (let m = now - 4; m <= now; m++) values.push([m, 20_000, 1, 1000]);
     const series = seriesFrom(values);
     const profile = foldProfile(emptyProfile(now - 200), series, now - cfg.windowMinutes + 1, cfg);
     const v = evaluateWindow(series, now, profile, 201, cfg);
@@ -93,7 +93,7 @@ describe("evaluateWindow", () => {
 
   it("winsorizes anomalous minutes so a spike cannot poison the long-term baseline", () => {
     const values = steady(now - 300, now - 1);
-    for (let m = now - 60; m < now - 50; m++) values.push([m, 50_000_000]);
+    for (let m = now - 60; m < now - 50; m++) values.push([m, 50_000_000, 1, 1000]);
     const series = seriesFrom(values);
     const profile = foldProfile(emptyProfile(now - 300), series, now, cfg);
     expect(profile.mean).toBeLessThan(1_000_000);
@@ -102,7 +102,7 @@ describe("evaluateWindow", () => {
   it("checks every window since the last evaluation", () => {
     const values = steady(now - 200, now);
     // A spike that ended 3 minutes ago is still caught on catch-up.
-    for (let m = now - 9; m <= now - 4; m++) values.push([m, 3_000_000]);
+    for (let m = now - 9; m <= now - 4; m++) values.push([m, 3_000_000, 1, 1000]);
     const series = seriesFrom(values);
     const profile = foldProfile(emptyProfile(now - 200), series, now - 15, cfg);
     const v = evaluateSlidingWindows(series, now - 10, now, profile, 201, cfg);

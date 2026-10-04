@@ -584,7 +584,7 @@ model NotificationDelivery {
 // Billing
 // ---------------------------------------------------------------------------
 
-/** Every Stripe webhook event received; the primary key makes processing idempotent. */
+/// Every Stripe webhook event received; the primary key makes processing idempotent.
 model StripeEvent {
   id             String            @id
   type           String
@@ -604,7 +604,7 @@ model StripeEvent {
   @@map("stripe_events")
 }
 
-/** One non-payment suspension and exactly which agents it stopped, so restoration is precise. */
+/// One non-payment suspension and exactly which agents it stopped, so restoration is precise.
 model BillingSuspension {
   id             String       @id @default(cuid())
   organizationId String

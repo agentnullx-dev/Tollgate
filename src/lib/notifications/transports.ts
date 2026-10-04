@@ -91,15 +91,23 @@ export interface EmailTransport {
 
 const globalForMail = globalThis as unknown as { __tollgateSmtp?: Transporter };
 
+/** Pool and timeout defaults, applied as URL query parameters (nodemailer only reads transport options from the URL). */
+const SMTP_URL_DEFAULTS: Record<string, string> = {
+  pool: "true",
+  maxConnections: "4",
+  connectionTimeout: "10000",
+  greetingTimeout: "10000",
+  socketTimeout: "20000",
+};
+
 function smtpTransporter(url: string): Transporter {
   if (!globalForMail.__tollgateSmtp) {
-    globalForMail.__tollgateSmtp = nodemailer.createTransport(url, {
-      pool: true,
-      maxConnections: 4,
-      connectionTimeout: 10_000,
-      greetingTimeout: 10_000,
-      socketTimeout: 20_000,
-    });
+    const parsed = new URL(url);
+    // Settings already present in SMTP_URL take precedence.
+    for (const [key, value] of Object.entries(SMTP_URL_DEFAULTS)) {
+      if (!parsed.searchParams.has(key)) parsed.searchParams.set(key, value);
+    }
+    globalForMail.__tollgateSmtp = nodemailer.createTransport(parsed.toString());
   }
   return globalForMail.__tollgateSmtp;
 }
